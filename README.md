@@ -1,31 +1,19 @@
 # Kotlin Outbox Pattern
 
-Kotlin/Spring Boot implementation of the transactional outbox pattern. `POST /orders` stores an order and its `OrderCreated` outbox event atomically; publishing is intentionally not implemented yet.
-
-## Requirements
-
-- Java 21
-- Docker Engine and Docker Compose
-
-The Gradle Wrapper downloads the configured Gradle distribution on first use.
+Kotlin/Spring Boot example of the transactional outbox pattern. Creating an order persists both the order and its `OrderCreated` event in one database transaction. A scheduled publisher logs pending events and marks them processed.
 
 ## Run locally
 
-Start PostgreSQL:
+Requirements: Java 21, Docker Engine, Docker Compose.
+
+Start PostgreSQL and the application:
 
 ```bash
 docker compose up -d postgres
-```
-
-Run the application using the `local` profile (database defaults are configured for the Compose service):
-
-```bash
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-The application listens on port `8080`. Check readiness at <http://localhost:8080/actuator/health>.
-
-Create an order:
+Create an order (HTTP `201 Created` returns its `orderId`):
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
@@ -33,20 +21,45 @@ curl -i -X POST http://localhost:8080/orders \
   -d '{"customerId":"123"}'
 ```
 
-A valid request returns `201 Created` with an `orderId`. A missing, null, empty, or blank `customerId` returns `400 Bad Request`. The order and its pending `OrderCreated` event are stored together; no event is published by the request.
+The publisher starts with the application. Configure it in `application.yml` or override the properties at startup:
 
-Stop PostgreSQL with `docker compose down`. Add `-v` only if you also want to delete its persisted data.
+```yaml
+outbox:
+  publisher:
+    enabled: true
+    fixed-delay-ms: 5000
+    batch-size: 10
+```
 
-## Test and build
+`enabled: false` disables the scheduler. One cycle processes at most `batch-size` pending events.
+
+Example log:
+
+```text
+Publishing outbox event id=... type=OrderCreated aggregateId=... payload={"orderId":"...","customerId":"123"}
+```
+
+Check processing state in PostgreSQL:
+
+```sql
+SELECT id, event_type, aggregate_id, payload, processed_at
+FROM outbox_events
+ORDER BY created_at, id;
+```
+
+## Delivery and concurrency semantics
+
+The order and outbox row are written atomically. The publisher selects pending rows in deterministic order using PostgreSQL `FOR UPDATE SKIP LOCKED`; row locks remain held while the batch is logged and updated in the same transaction. Other publisher instances skip rows already locked by a worker.
+
+Delivery is **at-least-once**, not exactly-once. If the application exits after a line is written to the log but before the database transaction commits, the row remains pending and can be logged again after restart. `SKIP LOCKED` prevents two live transactions from acquiring the same row simultaneously; it cannot atomically commit an external side effect and the database update. `processed_at` is written only after successful logging so a logging failure leaves the event retryable. A production consumer must therefore be idempotent. Processing is atomic per batch: a failure rolls back every row update in that batch, so earlier events in the batch can be delivered again.
+
+Stop PostgreSQL with `docker compose down`. Add `-v` only to delete its persisted data.
+
+## Tests
 
 ```bash
 ./gradlew clean test
 ./gradlew build
 ```
 
-The Spring integration test starts an isolated PostgreSQL instance using Testcontainers; Docker must be available when running tests.
-
-## Next stages
-
-1. OUTBOX-03: add scheduled processing for pending outbox events.
-2. Log each processed event and set its `processed_at` timestamp.
+Publisher unit tests run without Spring or Docker. Integration tests use PostgreSQL Testcontainers and require Docker.

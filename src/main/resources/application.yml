@@ -26,3 +26,9 @@ logging:
   level:
     root: INFO
     com.example.outbox: DEBUG
+
+outbox:
+  publisher:
+    enabled: true
+    fixed-delay-ms: 5000
+    batch-size: 10
