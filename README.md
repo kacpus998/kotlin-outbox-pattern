@@ -1,28 +1,49 @@
 # Kotlin Transactional Outbox
 
-Demonstration project for persisting an order and its `OrderCreated` event atomically, then publishing pending events from a scheduled worker. It intentionally publishes to application logs rather than a broker.
+## Overview
 
-## Stack and layout
+This project demonstrates the Transactional Outbox Pattern. Creating an order writes the order and its `OrderCreated` event to PostgreSQL in one transaction. A scheduled publisher reads pending events and simulates publication by writing them to the application log.
 
-Java 21, Kotlin 2.2, Spring Boot 3.5, Spring Web/Validation/Data JPA, PostgreSQL 17, Flyway, JdbcTemplate, JUnit 5 and Testcontainers. Code is organized by feature: `orders` contains API/application/domain/persistence; `outbox` contains event persistence and publisher.
+## Technology stack
+
+- Kotlin 2.2 and Java 21
+- Spring Boot 3.5, Spring WebFlux, and Project Reactor
+- Spring Data R2DBC with PostgreSQL 17
+- Flyway for schema migrations
+- JUnit 5 and PostgreSQL Testcontainers for tests
+- OpenAPI and Swagger UI for API documentation
+
+Orders and publisher database operations use R2DBC. JDBC is retained for Flyway's PostgreSQL migrations; integration tests also use JDBC assertions and fixtures.
+
+## Architecture
 
 ```text
-POST /orders → OrderService transaction → orders + outbox_events
-                                      → scheduled publisher → log → processed_at
+POST /orders
+  → Mono<CreateOrderResponse>
+  → R2DBC TransactionalOperator
+  → INSERT orders + outbox_events (atomic)
+
+reactive fixed-delay publisher
+  → Flux of pending events (bounded SELECT ... FOR UPDATE SKIP LOCKED)
+  → materialize batch, then publish sequentially
+  → UPDATE processed_at
+  → commit the batch transaction
 ```
 
-The publisher selects `processed_at IS NULL` rows ordered by `(created_at, id)` using PostgreSQL `FOR UPDATE SKIP LOCKED`. The selected rows remain locked until the transaction commits or rolls back.
+The publisher holds row locks on its transaction connection until the batch commits or rolls back. Separate workers skip rows already locked by another worker.
 
-## Run
+## Run locally
 
-Requirements: Java 21 and Docker with Compose.
+Requirements: Java 21, Docker Engine, and Docker Compose.
 
 ```bash
 docker compose up -d postgres
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-PostgreSQL configuration for local execution is in `application-local.yml` and can be overridden using `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`. Flyway creates the schema on startup; Hibernate uses `ddl-auto: validate` and does not create it. Timestamps use PostgreSQL `TIMESTAMPTZ` and Hibernate UTC.
+The local profile connects to the Compose database. Configure `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, and `DB_PASSWORD` as needed. If setting connection URLs directly, configure both `DB_URL` (JDBC for Flyway) and `R2DBC_URL` to the same database.
+
+Create an order:
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
@@ -30,44 +51,60 @@ curl -i -X POST http://localhost:8080/orders \
   -d '{"customerId":"123"}'
 ```
 
-Returns HTTP 201, for example `{"orderId":"<UUID>"}`. `customerId` must be non-blank and at most 255 characters; invalid values and malformed JSON return HTTP 400. There is no HTTP idempotency key: repeating an identical request creates another order and another event, each with fresh UUIDs.
+A successful request returns `201 Created`, for example:
 
-Interactive API docs: [Swagger UI](http://localhost:8080/swagger-ui.html); OpenAPI JSON: `/v3/api-docs`. The request schema and example are included.
+```json
+{"orderId":"<UUID>"}
+```
 
-## Persistence and publisher settings
+`customerId` must be non-blank and no longer than 255 characters. Invalid input and malformed JSON return `400 Bad Request`. Repeating a request creates a new order and event; the API does not accept an idempotency key.
 
-Flyway migration `V1` defines `orders` and `outbox_events`. The latter has a UUID primary key, order foreign key, JSONB payload, event type, UTC timestamps, and a partial index for unprocessed events. Inspect state with:
+The publisher is enabled by default (fixed delay 5000 ms, batch size 10). Configure `outbox.publisher.enabled`, `outbox.publisher.fixed-delay-ms`, and `outbox.publisher.batch-size` in `application.yml` or override them at startup. To disable publishing, set `outbox.publisher.enabled=false`.
+
+Inspect event state in PostgreSQL:
 
 ```sql
 SELECT id, event_type, aggregate_id, payload, processed_at
-FROM outbox_events ORDER BY created_at, id;
+FROM outbox_events
+ORDER BY created_at, id;
 ```
 
-Defaults: scheduler enabled, fixed delay 5000 ms, batch size 10. Set `outbox.publisher.enabled=false` to disable it, or configure `outbox.publisher.fixed-delay-ms` and positive `outbox.publisher.batch-size`. The batch is processed in one transaction: any failure rolls back its database updates. A repeatedly failing (“poison”) event remains pending and may repeatedly fail the batch, delaying later events; no DLQ or backoff is implemented. A long-running publication holds row locks and its transaction open.
+## API documentation
 
-Logs default to `outbox.publisher.logging.payload-mode=METADATA_ONLY`, logging only event ID, event type and aggregate ID. `REDACTED` adds only allowlisted `orderId` and masked `customerId`; unknown payload fields are omitted. There is no RAW mode. This does not alter the stored JSONB payload.
+- Swagger UI: <http://localhost:8080/swagger-ui.html>
+- OpenAPI JSON: <http://localhost:8080/v3/api-docs>
 
-## Delivery semantics and limitations
+## Transactional guarantees and delivery semantics
 
-**Implemented and tested:** the order and outbox row are persisted atomically; pending rows can be retried; `processed_at` is set only after publication returns successfully; normal subsequent cycles skip committed events. `SKIP LOCKED` prevents two active publisher transactions from selecting the same locked row. Ordering is deterministic among currently eligible rows, but multiple workers do not provide strict global FIFO.
+- The order and outbox event are committed or rolled back together.
+- A publisher batch selects pending rows using PostgreSQL `FOR UPDATE SKIP LOCKED`, logs them sequentially, and updates `processed_at` within one R2DBC transaction. A publication or database error rolls back that batch's database updates.
+- Delivery is **at-least-once**, not exactly-once. If log output succeeds but the transaction fails before commit, the same event can be logged again with the same event ID.
+- `SKIP LOCKED` prevents two active transactions from claiming the same locked row. Ordering is deterministic among currently eligible rows, but multiple workers do not guarantee global FIFO.
+- A real consumer should deduplicate by stable event ID. This sample has no consumer or inbox, so it does not provide exactly-once delivery.
 
-Delivery is **at-least-once**, not exactly-once. If the logger performs its side effect and the database transaction subsequently fails before commit, the row remains pending and the same stable event ID/payload can be published again. `processed_at` records the publisher's committed state only; it cannot atomically commit an external consumer's business effect. The current application has no event consumer or deduplication mechanism. A real consumer should deduplicate by stable event ID, commonly by inserting the ID into an `inbox`/`processed_events` table in the same transaction as its business effect. Even then the publisher's log output itself can repeat. Restart safety follows from database-backed pending state, but an actual full process-restart scenario is not covered by an automated test.
+## Logging
 
-This small example has no request idempotency keys, consumer inbox, broker, DLQ, retry backoff, authentication, or production-grade observability. These are deliberate scope limits, not implemented guarantees.
+The default `outbox.publisher.logging.payload-mode=METADATA_ONLY` logs only event ID, event type, and aggregate ID. `REDACTED` additionally logs allowlisted `orderId` and a masked `customerId`; unknown payload fields are omitted. Line separators are sanitized. There is no raw-payload mode, and logging does not modify the stored JSONB payload.
 
 ## Tests and CI
 
-```bash
-./gradlew clean test
-./gradlew build
-```
-
-Unit tests do not require Spring or Docker. Integration tests use a shared-lifecycle PostgreSQL 17 Testcontainers instance and require Docker. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
-
-On environments requiring Docker API compatibility override:
+Run the full test suite and build:
 
 ```bash
-OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew clean test
+OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew clean test --no-daemon
+OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew build --no-daemon
 ```
 
-Stop local PostgreSQL with `docker compose down`; do not use `-v` unless intentionally deleting its persistent data.
+Integration tests use PostgreSQL Testcontainers and require Docker. They cover API validation and atomic writes, R2DBC mapping, publisher rollback and at-least-once retry, concurrent `SKIP LOCKED` workers, cancellation and lock release, scheduler recovery, and logging redaction. GitHub Actions runs the Gradle Wrapper on a GitHub-hosted Ubuntu runner with Java 21 and uploads JUnit reports.
+
+A two-JVM restart check was run manually against a disposable PostgreSQL container using `tmpfs`; it is not part of the automated CI suite.
+
+For local PostgreSQL connectivity, start and stop Compose with `docker compose up -d postgres` and `docker compose down`. **Do not use `docker compose down -v`** unless intentionally deleting the persistent local database volume.
+
+## Limitations
+
+Publication is simulated by logging; there is no message broker or event consumer. Log output can repeat after a failure or restart. The publisher has no dead-letter queue or retry backoff, so a repeatedly failing event can hold up later events in a batch. The project also omits request idempotency keys, authentication, and production-grade observability.
+
+## Implementation history
+
+- `spring-mvc-v1.0.0` — tag for the previous MVC implementation.

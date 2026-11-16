@@ -1,6 +1,10 @@
 spring:
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/outbox}
+    url: ${DB_URL:jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:outbox}}
     username: ${DB_USERNAME:outbox}
     password: ${DB_PASSWORD:outbox}
     driver-class-name: org.postgresql.Driver
+  r2dbc:
+    url: ${R2DBC_URL:r2dbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:outbox}}
+    username: ${DB_USERNAME:outbox}
+    password: ${DB_PASSWORD:outbox}
