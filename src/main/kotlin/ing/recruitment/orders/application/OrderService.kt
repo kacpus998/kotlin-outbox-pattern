@@ -39,6 +39,13 @@ class OrderService(
             .bind("createdAt", createdAt)
             .fetch()
             .rowsUpdated()
+            .flatMap { rowsUpdated ->
+                if (rowsUpdated == 1L) {
+                    Mono.just(rowsUpdated)
+                } else {
+                    Mono.error(IllegalStateException("Expected to insert one order, but inserted $rowsUpdated"))
+                }
+            }
 
     private fun insertOutboxEvent(eventId: UUID, orderId: UUID, payload: String, createdAt: Instant): Mono<Long> =
         databaseClient.sql(
@@ -52,4 +59,11 @@ class OrderService(
             .bind("createdAt", createdAt)
             .fetch()
             .rowsUpdated()
+            .flatMap { rowsUpdated ->
+                if (rowsUpdated == 1L) {
+                    Mono.just(rowsUpdated)
+                } else {
+                    Mono.error(IllegalStateException("Expected to insert one outbox event, but inserted $rowsUpdated"))
+                }
+            }
 }

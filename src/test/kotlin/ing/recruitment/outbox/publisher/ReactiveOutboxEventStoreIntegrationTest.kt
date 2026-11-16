@@ -80,6 +80,27 @@ class ReactiveOutboxEventStoreIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun `reactive processed update rejects an already processed event on repeat`() {
+        val event = insertEvent(Instant.parse("2026-01-01T00:00:00Z"))
+
+        StepVerifier.create(transactionalOperator.transactional(store.markProcessedReactive(event.id)))
+            .verifyComplete()
+
+        StepVerifier.create(store.markProcessedReactive(event.id))
+            .expectErrorSatisfies { failure ->
+                assertTrue(failure.message.orEmpty().contains("updated=0"))
+            }
+            .verify()
+
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events WHERE id = ?", Int::class.java, event.id))
+        assertNotNull(jdbcTemplate.queryForObject(
+            "SELECT processed_at FROM outbox_events WHERE id = ?",
+            { rs, _ -> rs.getTimestamp("processed_at") },
+            event.id,
+        ))
+    }
+
+    @Test
     fun `reactive processed update errors when no pending row matches`() {
         val missingId = UUID.randomUUID()
 
