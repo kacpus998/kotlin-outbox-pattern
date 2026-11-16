@@ -1,9 +1,12 @@
 package ing.recruitment.orders.api
 
-import ing.recruitment.testsupport.PostgresIntegrationTest
 import com.fasterxml.jackson.databind.ObjectMapper
+import ing.recruitment.orders.application.OrderService
+import ing.recruitment.testsupport.PostgresIntegrationTest
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -13,19 +16,19 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
-import org.springframework.boot.test.web.client.TestRestTemplate
-import org.springframework.http.HttpEntity
-import org.springframework.http.HttpHeaders
-import org.springframework.http.HttpStatus
 import org.springframework.http.MediaType
-import org.springframework.http.ResponseEntity
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.context.ApplicationContext
+import org.springframework.boot.web.reactive.context.ReactiveWebServerApplicationContext
+import org.springframework.test.web.reactive.server.WebTestClient
+import reactor.core.publisher.Mono
+import reactor.test.StepVerifier
 import java.util.UUID
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class OrdersApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired
-    private lateinit var http: TestRestTemplate
+    private lateinit var webTestClient: WebTestClient
 
     @Autowired
     private lateinit var jdbcTemplate: JdbcTemplate
@@ -33,18 +36,27 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired
     private lateinit var objectMapper: ObjectMapper
 
+    @Autowired
+    private lateinit var applicationContext: ApplicationContext
+
+    @Autowired
+    private lateinit var orderService: OrderService
+
     @BeforeEach
     fun cleanDatabase() {
+        removeFailureTrigger()
         jdbcTemplate.update("DELETE FROM outbox_events")
         jdbcTemplate.update("DELETE FROM orders")
     }
 
-    @Test
-    fun `POST orders creates an order and one pending OrderCreated event`() {
-        val response = postJson("""{"customerId":"customer-123"}""")
+    @AfterEach
+    fun removeTestTriggerAndFunction() {
+        removeFailureTrigger()
+    }
 
-        assertEquals(HttpStatus.CREATED, response.statusCode)
-        val orderId = UUID.fromString(objectMapper.readTree(response.body).get("orderId").asText())
+    @Test
+    fun `POST orders creates an order and matching pending OrderCreated event`() {
+        val orderId = createOrder("""{"customerId":"customer-123"}""")
         assertEquals(1, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
         assertEquals(1, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
 
@@ -66,14 +78,29 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun `application runs on the reactive WebFlux server`() {
+        assertTrue(applicationContext is ReactiveWebServerApplicationContext)
+    }
+
+    @Test
+    fun `order creation publisher is lazy and writes only when subscribed`() {
+        val publisher: Mono<UUID> = orderService.createOrder("lazy-customer")
+        assertNoOrderWrites()
+
+        StepVerifier.create(publisher)
+            .assertNext { assertNotNull(it) }
+            .verifyComplete()
+
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
+        assertEquals(1, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
+    }
+
+    @Test
     fun `repeated identical requests create distinct orders and events`() {
-        val first = postJson("""{"customerId":"123"}""")
-        val second = postJson("""{"customerId":"123"}""")
-        assertEquals(HttpStatus.CREATED, first.statusCode)
-        assertEquals(HttpStatus.CREATED, second.statusCode)
-        val firstId = UUID.fromString(objectMapper.readTree(first.body).get("orderId").asText())
-        val secondId = UUID.fromString(objectMapper.readTree(second.body).get("orderId").asText())
-        org.junit.jupiter.api.Assertions.assertNotEquals(firstId, secondId)
+        val first = createOrder("""{"customerId":"123"}""")
+        val second = createOrder("""{"customerId":"123"}""")
+
+        assertNotEquals(first, second)
         assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
         assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
         assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(DISTINCT id) FROM outbox_events", Int::class.java))
@@ -81,49 +108,117 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `customerId longer than database column limit returns bad request`() {
-        val response = postJson("""{"customerId":"${"x".repeat(256)}"}""")
-        assertEquals(HttpStatus.BAD_REQUEST, response.statusCode)
-        assertEquals(0, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
+        exchange("""{"customerId":"${"x".repeat(256)}"}""")
+            .expectStatus()
+            .isBadRequest
+        assertNoOrderWrites()
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["{}", """{"customerId":null}""", """{"customerId":""}""", """{"customerId":"   "}"""])
+    fun `invalid customerId returns bad request without writes`(request: String) {
+        exchange(request).expectStatus().isBadRequest
+        assertNoOrderWrites()
     }
 
     @Test
-    fun `openapi and swagger ui are available`() {
-        val docs = http.getForEntity("/v3/api-docs", String::class.java)
-        assertEquals(HttpStatus.OK, docs.statusCode)
-        val schema = objectMapper.readTree(docs.body)
+    fun `malformed JSON returns bad request without writes`() {
+        webTestClient.post()
+            .uri("/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue("""{"customerId":"""")
+            .exchange()
+            .expectStatus()
+            .isBadRequest
+
+        assertNoOrderWrites()
+    }
+
+    @Test
+    fun `outbox insert failure returns an error and rolls back the order`() {
+        jdbcTemplate.execute(
+            """
+            CREATE FUNCTION fail_outbox_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced outbox insert failure';
+            END;
+            $$
+            """.trimIndent(),
+        )
+        jdbcTemplate.execute(
+            "CREATE TRIGGER fail_outbox_insert BEFORE INSERT ON outbox_events " +
+                "FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()",
+        )
+
+        exchange("""{"customerId":"customer-rollback"}""")
+            .expectStatus()
+            .is5xxServerError
+
+        assertNoOrderWrites()
+    }
+
+    @Test
+    fun `OpenAPI and Swagger UI describe the reactive HTTP contract`() {
+        val docs = webTestClient.get()
+            .uri("/v3/api-docs")
+            .exchange()
+            .expectStatus()
+            .isOk
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody!!
+        val schema = objectMapper.readTree(docs)
+
         assertTrue(schema.get("openapi").asText().startsWith("3."))
-        assertTrue(!schema.at("/paths/~1orders/post").isMissingNode)
-        assertTrue(!schema.at("/components/schemas/CreateOrderRequest").isMissingNode)
+        assertFalse(schema.at("/paths/~1orders/post").isMissingNode)
+        assertFalse(schema.at("/components/schemas/CreateOrderRequest").isMissingNode)
         assertTrue(schema.at("/paths/~1orders/post/responses").has("201"))
         assertTrue(schema.at("/paths/~1orders/post/responses").has("400"))
         assertTrue(
             schema.at("/paths/~1orders/post/responses/201/content/*~1*/schema/\$ref")
                 .asText().endsWith("/CreateOrderResponse"),
         )
-        val badRequestResponse = schema.at("/paths/~1orders/post/responses/400")
-        assertFalse(badRequestResponse.toString().contains("CreateOrderResponse"))
+        assertFalse(schema.at("/paths/~1orders/post/responses/400").toString().contains("CreateOrderResponse"))
 
-        val invalidRequest = postJson("""{"customerId":" "}""")
-        assertEquals(HttpStatus.BAD_REQUEST, invalidRequest.statusCode)
-        assertEquals(MediaType.APPLICATION_JSON, invalidRequest.headers.contentType)
-        assertEquals(400, objectMapper.readTree(invalidRequest.body).get("status").asInt())
-
-        val swagger = http.getForEntity("/swagger-ui.html", String::class.java)
-        assertTrue(swagger.statusCode.is2xxSuccessful || swagger.statusCode.is3xxRedirection)
+        webTestClient.get()
+            .uri("/swagger-ui.html")
+            .exchange()
+            .expectStatus()
+            .value { assertTrue(it in 200..399) }
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = ["{}", """{"customerId":null}""", """{"customerId":""}""", """{"customerId":"   "}"""])
-    fun `invalid customerId returns bad request without writes`(request: String) {
-        val response = postJson(request)
+    private fun exchange(request: String) =
+        webTestClient.post()
+            .uri("/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(request)
+            .exchange()
 
-        assertEquals(HttpStatus.BAD_REQUEST, response.statusCode)
+    private fun createOrder(request: String): UUID {
+        val customerId = objectMapper.readTree(request).get("customerId").asText()
+        val response = exchange(request)
+            .expectStatus()
+            .isCreated
+            .expectBody(CreateOrderResponse::class.java)
+            .returnResult()
+            .responseBody!!
+        assertEquals(
+            customerId,
+            jdbcTemplate.queryForObject("SELECT customer_id FROM orders WHERE id = ?", String::class.java, response.orderId),
+        )
+        return response.orderId
+    }
+
+    private fun assertNoOrderWrites() {
         assertEquals(0, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
         assertEquals(0, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
     }
 
-    private fun postJson(request: String): ResponseEntity<String> {
-        val headers = HttpHeaders().apply { contentType = MediaType.APPLICATION_JSON }
-        return http.postForEntity("/orders", HttpEntity(request, headers), String::class.java)
+    private fun removeFailureTrigger() {
+        try {
+            jdbcTemplate.execute("DROP TRIGGER IF EXISTS fail_outbox_insert ON outbox_events")
+        } finally {
+            jdbcTemplate.execute("DROP FUNCTION IF EXISTS fail_outbox_insert()")
+        }
     }
 }

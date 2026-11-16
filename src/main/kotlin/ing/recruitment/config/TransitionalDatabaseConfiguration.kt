@@ -1,14 +1,13 @@
 package ing.recruitment.config
 
 import io.r2dbc.spi.ConnectionFactory
-import jakarta.persistence.EntityManagerFactory
 import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.context.annotation.Primary
 import org.springframework.r2dbc.connection.R2dbcTransactionManager
-import org.springframework.orm.jpa.JpaTransactionManager
+import org.springframework.jdbc.support.JdbcTransactionManager
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.ReactiveTransactionManager
 import org.springframework.transaction.reactive.TransactionalOperator
@@ -26,8 +25,8 @@ class TransitionalDatabaseConfiguration {
 
     @Bean
     @Primary
-    fun transactionManager(entityManagerFactory: EntityManagerFactory): PlatformTransactionManager =
-        JpaTransactionManager(entityManagerFactory)
+    fun transactionManager(dataSource: DataSource): PlatformTransactionManager =
+        JdbcTransactionManager(dataSource)
 
     @Bean
     fun reactiveTransactionManager(connectionFactory: ConnectionFactory): ReactiveTransactionManager =

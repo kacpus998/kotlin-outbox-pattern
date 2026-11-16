@@ -4,11 +4,11 @@ Demonstration project for persisting an order and its `OrderCreated` event atomi
 
 ## Stack and layout
 
-Java 21, Kotlin 2.2, Spring Boot 3.5, Spring Web/Validation/Data JPA, PostgreSQL 17, Flyway, JdbcTemplate, JUnit 5 and Testcontainers. Code is organized by feature: `orders` contains API/application/domain/persistence; `outbox` contains event persistence and publisher.
+Java 21, Kotlin 2.2, Spring Boot 3.5, Spring WebFlux, Project Reactor, Spring Data R2DBC, PostgreSQL 17, Flyway, JdbcTemplate, JUnit 5 and Testcontainers. The Orders API uses R2DBC; the scheduled outbox publisher remains JDBC-based.
 
 ```text
-POST /orders → OrderService transaction → orders + outbox_events
-                                      → scheduled publisher → log → processed_at
+POST /orders → Mono<CreateOrderResponse> → R2DBC transaction → orders + outbox_events
+scheduled publisher → JDBC transaction → log → processed_at
 ```
 
 The publisher selects `processed_at IS NULL` rows ordered by `(created_at, id)` using PostgreSQL `FOR UPDATE SKIP LOCKED`. The selected rows remain locked until the transaction commits or rolls back.
@@ -22,7 +22,7 @@ docker compose up -d postgres
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-PostgreSQL configuration for local execution is in `application-local.yml` and can be overridden using `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`. Flyway creates the schema on startup; Hibernate uses `ddl-auto: validate` and does not create it. Timestamps use PostgreSQL `TIMESTAMPTZ` and Hibernate UTC.
+PostgreSQL configuration for local execution is in `application-local.yml`. `DB_HOST`, `DB_PORT`, and `DB_NAME` configure JDBC and R2DBC together; credentials use `DB_USERNAME` and `DB_PASSWORD`. If overriding connection URLs directly, set both `DB_URL` and `R2DBC_URL` to the same database and schema. Flyway applies the existing schema migration over JDBC before application requests are served. Orders persistence uses R2DBC, while the scheduled publisher uses a separate JDBC connection pool against that same schema. Timestamps use PostgreSQL `TIMESTAMPTZ`.
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
@@ -62,7 +62,7 @@ This small example has no request idempotency keys, consumer inbox, broker, DLQ,
 ./gradlew build
 ```
 
-Unit tests do not require Spring or Docker. Integration tests use a shared-lifecycle PostgreSQL 17 Testcontainers instance and require Docker. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
+Unit tests do not require Spring or Docker. Integration tests use `WebTestClient`, `StepVerifier`, and a shared-lifecycle PostgreSQL 17 Testcontainers instance; Docker is required. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
 
 On environments requiring Docker API compatibility override:
 

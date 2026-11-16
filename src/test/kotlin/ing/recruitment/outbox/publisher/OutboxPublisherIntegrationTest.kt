@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
+import reactor.test.StepVerifier
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -52,7 +53,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `publishes order event and marks it processed`() {
-        val orderId = orderService.createOrder("customer-123")
+        val orderId = createOrder("customer-123")
         val eventId = jdbcTemplate.queryForObject(
             "SELECT id FROM outbox_events WHERE aggregate_id = ?",
             UUID::class.java,
@@ -83,7 +84,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `second cycle does not reprocess committed event`() {
-        val orderId = orderService.createOrder("customer-123")
+        val orderId = createOrder("customer-123")
 
         assertEquals(1, processingService.processBatch())
         assertEquals(0, processingService.processBatch())
@@ -98,7 +99,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `logger failure rolls back and event can be retried`() {
-        val orderId = orderService.createOrder("customer-123")
+        val orderId = createOrder("customer-123")
         doThrow(IllegalStateException("simulated logger failure"))
             .doNothing()
             .`when`(eventLogger).publish(anyEvent())
@@ -119,7 +120,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `failure after external publication before commit retries same event id`() {
-        val orderId = orderService.createOrder("customer-123")
+        val orderId = createOrder("customer-123")
         val publishedIds = java.util.Collections.synchronizedList(mutableListOf<UUID>())
         doAnswer {
             publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
@@ -157,7 +158,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `concurrent workers skip locked records and process all records once`() {
-        repeat(4) { orderService.createOrder("customer-$it") }
+        repeat(4) { createOrder("customer-$it") }
         val firstLoggerEntered = CountDownLatch(1)
         val releaseFirstWorker = CountDownLatch(1)
         val calls = AtomicInteger()
@@ -196,7 +197,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `one cycle processes no more than configured batch size`() {
-        repeat(3) { orderService.createOrder("customer-$it") }
+        repeat(3) { createOrder("customer-$it") }
 
         assertEquals(2, processingService.processBatch())
         assertEquals(2, jdbcTemplate.queryForObject(
@@ -214,6 +215,14 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
         { rs, _ -> rs.getTimestamp(1) },
         id,
     )
+
+    private fun createOrder(customerId: String): UUID {
+        var orderId: UUID? = null
+        StepVerifier.create(orderService.createOrder(customerId))
+            .assertNext { orderId = it }
+            .verifyComplete()
+        return requireNotNull(orderId)
+    }
 
     private fun anyEvent(): OutboxPendingEvent =
         org.mockito.ArgumentMatchers.any(OutboxPendingEvent::class.java)

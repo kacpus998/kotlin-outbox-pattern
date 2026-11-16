@@ -8,6 +8,7 @@ import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
+import reactor.core.publisher.Mono
 import io.swagger.v3.oas.annotations.Operation
 import io.swagger.v3.oas.annotations.media.Content
 import io.swagger.v3.oas.annotations.media.ExampleObject
@@ -37,6 +38,7 @@ class OrdersController(
             ),
         ],
     )
-    fun createOrder(@Valid @RequestBody request: CreateOrderRequest): CreateOrderResponse =
-        CreateOrderResponse(orderId = orderService.createOrder(request.customerId))
+    fun createOrder(@Valid @RequestBody request: CreateOrderRequest): Mono<CreateOrderResponse> =
+        orderService.createOrder(request.customerId)
+            .map { orderId -> CreateOrderResponse(orderId = orderId) }
 }
