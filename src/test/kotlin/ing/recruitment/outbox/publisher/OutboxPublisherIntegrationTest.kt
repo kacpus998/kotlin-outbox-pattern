@@ -5,6 +5,7 @@ import ing.recruitment.testsupport.PostgresIntegrationTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -16,13 +17,14 @@ import org.mockito.Mockito.verify
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.context.annotation.AnnotationConfigApplicationContext
+import org.springframework.scheduling.annotation.EnableScheduling
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import reactor.test.StepVerifier
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -233,18 +235,88 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun `closing scheduled publisher context cancels in flight batch and releases row locks`() {
+        val orderId = createOrder("customer-shutdown")
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?", UUID::class.java, orderId,
+        )!!
+        val loggerEntered = CountDownLatch(1)
+        val releaseLogger = CountDownLatch(1)
+        val loggerExited = CountDownLatch(1)
+        doAnswer {
+            loggerEntered.countDown()
+            try {
+                releaseLogger.await()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                loggerExited.countDown()
+            }
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+
+        val context = AnnotationConfigApplicationContext()
+        context.environment.propertySources.addFirst(
+            org.springframework.core.env.MapPropertySource(
+                "shutdown-test", mapOf("outbox.publisher.fixed-delay-ms" to "100"),
+            ),
+        )
+        context.register(SchedulingOnly::class.java)
+        context.registerBean("scheduledPublisher", OutboxPublisher::class.java, java.util.function.Supplier {
+            OutboxPublisher(processingService)
+        })
+        try {
+            context.refresh()
+            assertTrue(loggerEntered.await(10, TimeUnit.SECONDS))
+            assertTrue(skipLockedPendingIds().isEmpty(), "scheduled transaction must hold the row lock before shutdown")
+
+            context.close()
+            assertTrue(loggerExited.await(10, TimeUnit.SECONDS), "shutdown must cancel the in flight publication")
+            awaitCondition(10) { eventId in skipLockedPendingIds() }
+            assertNull(processedAt(eventId), "shutdown must leave the event pending for a later process")
+
+            val unexpectedPublication = CountDownLatch(1)
+            doAnswer { unexpectedPublication.countDown(); null }.`when`(eventLogger).publish(anyEvent())
+            assertFalse(unexpectedPublication.await(500, TimeUnit.MILLISECONDS), "closed context must not start another cycle")
+            assertEquals(1, processBatch(), "a new worker must be able to retry the pending event")
+            assertNotNull(processedAt(eventId))
+        } finally {
+            releaseLogger.countDown()
+            context.close()
+        }
+    }
+
+    @EnableScheduling
+    private class SchedulingOnly
+
+    @Test
     fun `concurrent workers skip locked records and process all records once`() {
         repeat(4) { createOrder("customer-$it") }
+        val expectedIds = jdbcTemplate.query(
+            "SELECT id FROM outbox_events ORDER BY created_at, id",
+        ) { rs, _ -> rs.getObject("id", UUID::class.java) }
+        val firstBatchIds = expectedIds.take(2).toSet()
         val firstLoggerEntered = CountDownLatch(1)
+        val secondLoggerEntered = CountDownLatch(1)
         val releaseFirstWorker = CountDownLatch(1)
+        val releaseSecondWorker = CountDownLatch(1)
         val calls = AtomicInteger()
-        val publishedIds = ConcurrentHashMap.newKeySet<UUID>()
+        val firstPublishedIds = CopyOnWriteArrayList<UUID>()
+        val secondPublishedIds = CopyOnWriteArrayList<UUID>()
         doAnswer {
             val event = it.getArgument<OutboxPendingEvent>(0)
-            check(publishedIds.add(event.id)) { "event ${event.id} was concurrently published twice" }
             if (calls.incrementAndGet() == 1) {
+                firstPublishedIds.add(event.id)
                 firstLoggerEntered.countDown()
                 check(releaseFirstWorker.await(10, TimeUnit.SECONDS))
+            } else if (releaseFirstWorker.count > 0) {
+                // First worker is still blocked; only the second worker can publish here.
+                secondPublishedIds.add(event.id)
+                secondLoggerEntered.countDown()
+                check(releaseSecondWorker.await(10, TimeUnit.SECONDS))
+            } else {
+                // Second worker has committed before the first worker is released.
+                firstPublishedIds.add(event.id)
             }
             null
         }.`when`(eventLogger).publish(anyEvent())
@@ -259,12 +331,35 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
                 requireNotNull(processingService.processBatch().block(Duration.ofSeconds(10)))
             }
 
+            assertTrue(secondLoggerEntered.await(10, TimeUnit.SECONDS), "second worker did not publish while first held locks")
+            assertFalse(first.isDone)
+            assertFalse(second.isDone)
+            assertTrue(skipLockedPendingIds().isEmpty(), "both batches must be locked simultaneously")
+            val activeWorkers = jdbcTemplate.query(
+                """
+                SELECT pid, backend_xid::text AS transaction_id FROM pg_stat_activity
+                WHERE datname = current_database() AND state = 'idle in transaction'
+                  AND query LIKE '%FOR UPDATE SKIP LOCKED%'
+                """.trimIndent(),
+            ) { rs, _ -> rs.getInt("pid") to rs.getString("transaction_id") }
+            assertEquals(2, activeWorkers.size, "both SELECT transactions must still be open")
+            assertEquals(2, activeWorkers.map { it.first }.toSet().size, "workers must use distinct PostgreSQL backends")
+            assertTrue(activeWorkers.all { it.second != null }, "row-locking transactions must have transaction IDs")
+            assertEquals(2, activeWorkers.map { it.second }.toSet().size, "workers must use distinct transactions")
+            assertTrue(expectedIds.all { processedAt(it) == null })
+
+            releaseSecondWorker.countDown()
             assertEquals(2, second.get(10, TimeUnit.SECONDS))
+            assertFalse(first.isDone, "second worker must commit before the first worker is released")
+            assertTrue(firstBatchIds.all { processedAt(it) == null })
+            assertTrue(expectedIds.drop(2).all { processedAt(it) != null })
             releaseFirstWorker.countDown()
             assertEquals(2, first.get(10, TimeUnit.SECONDS))
         } finally {
             releaseFirstWorker.countDown()
+            releaseSecondWorker.countDown()
             workers.shutdownNow()
+            assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS))
         }
 
         assertEquals(4, jdbcTemplate.queryForObject(
@@ -272,7 +367,11 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
             Int::class.java,
         ))
         assertEquals(4, calls.get())
-        assertEquals(4, publishedIds.size)
+        assertEquals(expectedIds.take(2), firstPublishedIds)
+        assertEquals(expectedIds.drop(2), secondPublishedIds)
+        assertTrue(firstPublishedIds.toSet().intersect(secondPublishedIds.toSet()).isEmpty())
+        assertEquals(expectedIds.toSet(), (firstPublishedIds + secondPublishedIds).toSet())
+        assertEquals(0, processBatch(), "no pending event may be lost or left behind")
     }
 
     @Test

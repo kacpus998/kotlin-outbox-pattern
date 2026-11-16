@@ -7,6 +7,9 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.EnumSource
+import org.junit.jupiter.params.provider.ValueSource
 import org.slf4j.LoggerFactory
 import org.junit.jupiter.api.assertThrows
 import org.springframework.boot.context.properties.bind.BindException
@@ -82,6 +85,56 @@ class OutboxEventLoggerTest {
             assertEquals(1, appender.list.size)
             assertTrue(!appender.list.single().formattedMessage.contains("\r"))
             assertTrue(!appender.list.single().formattedMessage.contains("\n"))
+        } finally { closeLogs(appender) }
+    }
+
+    @ParameterizedTest
+    @EnumSource(PayloadMode::class)
+    fun `logging modes exclude nested secrets and prevent line injection`(mode: PayloadMode) {
+        val appender = captureLogs()
+        val payload = ObjectMapper().createObjectNode().apply {
+            put("orderId", "order\r\nFORGED=true\u0085\u2028\u2029")
+            putObject("customerId").put("password", "customer-secret")
+            putObject("unknown").put("token", "unknown-secret\r\nFORGED=secret")
+            putArray("credentials").add("array-secret")
+        }
+        val originalPayload = payload.deepCopy()
+        val event = event(payload, "OrderCreated\r\nFORGED=type\u0085\u2028\u2029")
+        try {
+            Slf4jOutboxEventLogger(OutboxLoggingProperties().apply { payloadMode = mode }).publish(event)
+
+            val message = appender.list.single().formattedMessage
+            assertTrue(message.contains(event.id.toString()))
+            assertTrue(message.contains(event.aggregateId.toString()))
+            listOf("customer-secret", "unknown-secret", "array-secret", "password", "token", "credentials", "unknown")
+                .forEach { assertTrue(!message.contains(it), "must not log $it in $mode") }
+            listOf('\r', '\n', '\u0085', '\u2028', '\u2029').forEach {
+                assertTrue(!message.contains(it), "must not log line separator U+${it.code.toString(16)}")
+            }
+            if (mode == PayloadMode.METADATA_ONLY) {
+                assertTrue(!message.contains("payload="))
+                assertTrue(!message.contains("orderId"))
+                assertTrue(!message.contains("customerId"))
+            } else {
+                val loggedPayload = ObjectMapper().readTree(message.substringAfter(" payload="))
+                assertEquals(setOf("orderId", "customerId"), loggedPayload.fieldNames().asSequence().toSet())
+                assertEquals("order  FORGED=true   ", loggedPayload["orderId"].asText())
+                assertEquals("[REDACTED]", loggedPayload["customerId"].asText())
+            }
+            assertEquals(originalPayload, payload, "logging must not modify the source event")
+        } finally { closeLogs(appender) }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["""{"orderId":{"token":"nested-secret"}}""", """{"orderId":["array-secret"]}""", "null", "[]"])
+    fun `redacted mode never serializes non textual order ids or non object payloads`(json: String) {
+        val appender = captureLogs()
+        try {
+            Slf4jOutboxEventLogger(OutboxLoggingProperties().apply { payloadMode = PayloadMode.REDACTED })
+                .publish(event(ObjectMapper().readTree(json)))
+            val message = appender.list.single().formattedMessage
+            assertEquals(ObjectMapper().readTree("{}"), ObjectMapper().readTree(message.substringAfter(" payload=")))
+            assertTrue(!message.contains("secret"))
         } finally { closeLogs(appender) }
     }
 
