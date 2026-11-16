@@ -1,6 +1,6 @@
 # Kotlin Outbox Pattern
 
-Minimal Spring Boot foundation for a transactional outbox implementation. This bootstrap does not yet include order APIs, domain entities, or an event publisher.
+Kotlin/Spring Boot implementation of the transactional outbox pattern. `POST /orders` stores an order and its `OrderCreated` outbox event atomically; publishing is intentionally not implemented yet.
 
 ## Requirements
 
@@ -25,6 +25,16 @@ Run the application using the `local` profile (database defaults are configured 
 
 The application listens on port `8080`. Check readiness at <http://localhost:8080/actuator/health>.
 
+Create an order:
+
+```bash
+curl -i -X POST http://localhost:8080/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"123"}'
+```
+
+A valid request returns `201 Created` with an `orderId`. A missing, null, empty, or blank `customerId` returns `400 Bad Request`. The order and its pending `OrderCreated` event are stored together; no event is published by the request.
+
 Stop PostgreSQL with `docker compose down`. Add `-v` only if you also want to delete its persisted data.
 
 ## Test and build
@@ -38,6 +48,5 @@ The Spring integration test starts an isolated PostgreSQL instance using Testcon
 
 ## Next stages
 
-1. OUTBOX-02: add Flyway schema migrations for `orders` and `outbox_events`.
-2. Add transactional order creation and persist its outbox event in the same transaction.
-3. Add scheduled outbox processing, event logging, and processed-state handling.
+1. OUTBOX-03: add scheduled processing for pending outbox events.
+2. Log each processed event and set its `processed_at` timestamp.
