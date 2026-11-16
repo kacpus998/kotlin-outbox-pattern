@@ -105,7 +105,6 @@ For local PostgreSQL connectivity, start and stop Compose with `docker compose u
 
 Publication is simulated by logging; there is no message broker or event consumer. Log output can repeat after a failure or restart. The publisher has no dead-letter queue or retry backoff, so a repeatedly failing event can hold up later events in a batch. The project also omits request idempotency keys, authentication, and production-grade observability.
 
-## Implementations
+## Implementation history
 
-- `spring-mvc-v1.0.0` — existing tag for the previous MVC implementation.
-- `reactive-v1.0.0` — planned release tag for the reactive implementation; it has not been created.
+- `spring-mvc-v1.0.0` — tag for the previous MVC implementation.
