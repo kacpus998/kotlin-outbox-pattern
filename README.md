@@ -9,7 +9,7 @@ This project demonstrates the Transactional Outbox Pattern. Creating an order wr
 | Version | Technology stack | Source code | Commit |
 | --- | --- | --- | --- |
 | Spring MVC (`spring-mvc-v1.0.0`) | Spring MVC, Spring Data JPA, JDBC | [Browse MVC implementation](https://github.com/kacpus998/kotlin-outbox-pattern/tree/spring-mvc-v1.0.0) | [`77afa59`](https://github.com/kacpus998/kotlin-outbox-pattern/commit/77afa592fc372e662236862617fd27aa4ec47616) |
-| Reactive (`reactive-v1.0.0`) | Spring WebFlux, Project Reactor, R2DBC | [Browse Reactive implementation](https://github.com/kacpus998/kotlin-outbox-pattern/tree/reactive-v1.0.0) | [`9924742`](https://github.com/kacpus998/kotlin-outbox-pattern/commit/99247425cba5ab849f3d4a205de0d5c8d4ceef26) |
+| Reactive (`reactive-v1.0.0`) | Spring WebFlux, Project Reactor, R2DBC | [Browse Reactive implementation](https://github.com/kacpus998/kotlin-outbox-pattern/tree/reactive-v1.0.0) | [tag target](https://github.com/kacpus998/kotlin-outbox-pattern/commit/reactive-v1.0.0) |
 
 Both versions implement the Transactional Outbox Pattern, with different persistence and transaction models. The `main` branch currently contains the reactive implementation and may include commits after the `reactive-v1.0.0` tag.
 
