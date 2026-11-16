@@ -17,6 +17,11 @@ abstract class PostgresIntegrationTest {
             registry.add("spring.datasource.url", container::getJdbcUrl)
             registry.add("spring.datasource.username", container::getUsername)
             registry.add("spring.datasource.password", container::getPassword)
+            registry.add("spring.r2dbc.url") {
+                "r2dbc:postgresql://${container.host}:${container.getMappedPort(PostgreSQLContainer.POSTGRESQL_PORT)}/${container.databaseName}"
+            }
+            registry.add("spring.r2dbc.username", container::getUsername)
+            registry.add("spring.r2dbc.password", container::getPassword)
         }
     }
 }
