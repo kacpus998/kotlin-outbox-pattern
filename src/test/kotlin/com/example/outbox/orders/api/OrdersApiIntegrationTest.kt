@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
@@ -61,6 +62,41 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
         val payload = objectMapper.readTree(event["payload"].toString())
         assertEquals(orderId.toString(), payload.get("orderId").asText())
         assertEquals("customer-123", payload.get("customerId").asText())
+    }
+
+    @Test
+    fun `repeated identical requests create distinct orders and events`() {
+        val first = postJson("""{"customerId":"123"}""")
+        val second = postJson("""{"customerId":"123"}""")
+        assertEquals(HttpStatus.CREATED, first.statusCode)
+        assertEquals(HttpStatus.CREATED, second.statusCode)
+        val firstId = UUID.fromString(objectMapper.readTree(first.body).get("orderId").asText())
+        val secondId = UUID.fromString(objectMapper.readTree(second.body).get("orderId").asText())
+        org.junit.jupiter.api.Assertions.assertNotEquals(firstId, secondId)
+        assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
+        assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
+        assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(DISTINCT id) FROM outbox_events", Int::class.java))
+    }
+
+    @Test
+    fun `customerId longer than database column limit returns bad request`() {
+        val response = postJson("""{"customerId":"${"x".repeat(256)}"}""")
+        assertEquals(HttpStatus.BAD_REQUEST, response.statusCode)
+        assertEquals(0, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
+    }
+
+    @Test
+    fun `openapi and swagger ui are available`() {
+        val docs = http.getForEntity("/v3/api-docs", String::class.java)
+        assertEquals(HttpStatus.OK, docs.statusCode)
+        val schema = objectMapper.readTree(docs.body)
+        assertTrue(schema.get("openapi").asText().startsWith("3."))
+        assertTrue(!schema.at("/paths/~1orders/post").isMissingNode)
+        assertTrue(!schema.at("/components/schemas/CreateOrderRequest").isMissingNode)
+        assertTrue(schema.at("/paths/~1orders/post/responses").has("201"))
+        assertTrue(schema.at("/paths/~1orders/post/responses").has("400"))
+        val swagger = http.getForEntity("/swagger-ui.html", String::class.java)
+        assertTrue(swagger.statusCode.is2xxSuccessful || swagger.statusCode.is3xxRedirection)
     }
 
     @ParameterizedTest

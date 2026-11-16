@@ -118,6 +118,44 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun `failure after external publication before commit retries same event id`() {
+        val orderId = orderService.createOrder("customer-123")
+        val publishedIds = java.util.Collections.synchronizedList(mutableListOf<UUID>())
+        doAnswer {
+            publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?", UUID::class.java, orderId,
+        )!!
+        jdbcTemplate.execute(
+            """
+            CREATE FUNCTION fail_processed_update() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'forced failure after publication'; END;
+            $$
+            """.trimIndent(),
+        )
+        jdbcTemplate.execute(
+            "CREATE TRIGGER fail_processed_update BEFORE UPDATE OF processed_at ON outbox_events " +
+                "FOR EACH ROW EXECUTE FUNCTION fail_processed_update()",
+        )
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException::class.java) {
+                processingService.processBatch()
+            }
+            assertNull(processedAt(eventId))
+            assertEquals(listOf(eventId), publishedIds)
+        } finally {
+            jdbcTemplate.execute("DROP TRIGGER IF EXISTS fail_processed_update ON outbox_events")
+            jdbcTemplate.execute("DROP FUNCTION IF EXISTS fail_processed_update()")
+        }
+
+        assertEquals(1, processingService.processBatch())
+        assertNotNull(processedAt(eventId))
+        assertEquals(listOf(eventId, eventId), publishedIds)
+    }
+
+    @Test
     fun `concurrent workers skip locked records and process all records once`() {
         repeat(4) { orderService.createOrder("customer-$it") }
         val firstLoggerEntered = CountDownLatch(1)

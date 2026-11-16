@@ -32,3 +32,5 @@ outbox:
     enabled: true
     fixed-delay-ms: 5000
     batch-size: 10
+    logging:
+      payload-mode: METADATA_ONLY
