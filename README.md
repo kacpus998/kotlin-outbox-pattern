@@ -105,6 +105,21 @@ For local PostgreSQL connectivity, start and stop Compose with `docker compose u
 
 Publication is simulated by logging; there is no message broker or event consumer. Log output can repeat after a failure or restart. The publisher has no dead-letter queue or retry backoff, so a repeatedly failing event can hold up later events in a batch. The project also omits request idempotency keys, authentication, and production-grade observability.
 
-## Implementation history
+## Implementation Versions
 
-- `spring-mvc-v1.0.0` — tag for the previous MVC implementation.
+| Version | Implementation |
+| --- | --- |
+| [`spring-mvc-v1.0.0`](https://github.com/kacpus998/kotlin-outbox-pattern/tree/spring-mvc-v1.0.0) | Spring MVC, Spring Data JPA, JDBC |
+| [`reactive-v1.0.0`](https://github.com/kacpus998/kotlin-outbox-pattern/tree/reactive-v1.0.0) | Spring WebFlux, Project Reactor, R2DBC |
+
+The `main` branch currently contains the reactive implementation. To check out either tagged version locally:
+
+```bash
+# Check out the MVC/JPA/JDBC version
+git switch --detach spring-mvc-v1.0.0
+
+# Or check out the reactive version
+git switch --detach reactive-v1.0.0
+```
+
+Each command checks out that version in detached-HEAD mode. Return to the current development branch with `git switch main`.
