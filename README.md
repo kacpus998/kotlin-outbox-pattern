@@ -1,19 +1,28 @@
-# Kotlin Outbox Pattern
+# Kotlin Transactional Outbox
 
-Kotlin/Spring Boot example of the transactional outbox pattern. Creating an order persists both the order and its `OrderCreated` event in one database transaction. A scheduled publisher logs pending events and marks them processed.
+Demonstration project for persisting an order and its `OrderCreated` event atomically, then publishing pending events from a scheduled worker. It intentionally publishes to application logs rather than a broker.
 
-## Run locally
+## Stack and layout
 
-Requirements: Java 21, Docker Engine, Docker Compose.
+Java 21, Kotlin 2.2, Spring Boot 3.5, Spring Web/Validation/Data JPA, PostgreSQL 17, Flyway, JdbcTemplate, JUnit 5 and Testcontainers. Code is organized by feature: `orders` contains API/application/domain/persistence; `outbox` contains event persistence and publisher.
 
-Start PostgreSQL and the application:
+```text
+POST /orders → OrderService transaction → orders + outbox_events
+                                      → scheduled publisher → log → processed_at
+```
+
+The publisher selects `processed_at IS NULL` rows ordered by `(created_at, id)` using PostgreSQL `FOR UPDATE SKIP LOCKED`. The selected rows remain locked until the transaction commits or rolls back.
+
+## Run
+
+Requirements: Java 21 and Docker with Compose.
 
 ```bash
 docker compose up -d postgres
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-Create an order (HTTP `201 Created` returns its `orderId`):
+PostgreSQL configuration for local execution is in `application-local.yml` and can be overridden using `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`. Flyway creates the schema on startup; Hibernate uses `ddl-auto: validate` and does not create it. Timestamps use PostgreSQL `TIMESTAMPTZ` and Hibernate UTC.
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
@@ -21,51 +30,44 @@ curl -i -X POST http://localhost:8080/orders \
   -d '{"customerId":"123"}'
 ```
 
-The publisher starts with the application. Configure it in `application.yml` or override the properties at startup:
+Returns HTTP 201, for example `{"orderId":"<UUID>"}`. `customerId` must be non-blank and at most 255 characters; invalid values and malformed JSON return HTTP 400. There is no HTTP idempotency key: repeating an identical request creates another order and another event, each with fresh UUIDs.
 
-```yaml
-outbox:
-  publisher:
-    enabled: true
-    fixed-delay-ms: 5000
-    batch-size: 10
-```
+Interactive API docs: [Swagger UI](http://localhost:8080/swagger-ui.html); OpenAPI JSON: `/v3/api-docs`. The request schema and example are included.
 
-`enabled: false` disables the scheduler. One cycle processes at most `batch-size` pending events.
+## Persistence and publisher settings
 
-Example log:
-
-```text
-Publishing outbox event id=... type=OrderCreated aggregateId=... payload={"orderId":"...","customerId":"123"}
-```
-
-Check processing state in PostgreSQL:
+Flyway migration `V1` defines `orders` and `outbox_events`. The latter has a UUID primary key, order foreign key, JSONB payload, event type, UTC timestamps, and a partial index for unprocessed events. Inspect state with:
 
 ```sql
 SELECT id, event_type, aggregate_id, payload, processed_at
-FROM outbox_events
-ORDER BY created_at, id;
+FROM outbox_events ORDER BY created_at, id;
 ```
 
-## Delivery and concurrency semantics
+Defaults: scheduler enabled, fixed delay 5000 ms, batch size 10. Set `outbox.publisher.enabled=false` to disable it, or configure `outbox.publisher.fixed-delay-ms` and positive `outbox.publisher.batch-size`. The batch is processed in one transaction: any failure rolls back its database updates. A repeatedly failing (“poison”) event remains pending and may repeatedly fail the batch, delaying later events; no DLQ or backoff is implemented. A long-running publication holds row locks and its transaction open.
 
-The order and outbox row are written atomically. The publisher selects pending rows in deterministic order using PostgreSQL `FOR UPDATE SKIP LOCKED`; row locks remain held while the batch is logged and updated in the same transaction. Other publisher instances skip rows already locked by a worker.
+Logs default to `outbox.publisher.logging.payload-mode=METADATA_ONLY`, logging only event ID, event type and aggregate ID. `REDACTED` adds only allowlisted `orderId` and masked `customerId`; unknown payload fields are omitted. There is no RAW mode. This does not alter the stored JSONB payload.
 
-Delivery is **at-least-once**, not exactly-once. If the application exits after a line is written to the log but before the database transaction commits, the row remains pending and can be logged again after restart. `SKIP LOCKED` prevents two live transactions from acquiring the same row simultaneously; it cannot atomically commit an external side effect and the database update. `processed_at` is written only after successful logging so a logging failure leaves the event retryable. A production consumer must therefore be idempotent. Processing is atomic per batch: a failure rolls back every row update in that batch, so earlier events in the batch can be delivered again.
+## Delivery semantics and limitations
 
-Stop PostgreSQL with `docker compose down`. Add `-v` only to delete its persisted data.
+**Implemented and tested:** the order and outbox row are persisted atomically; pending rows can be retried; `processed_at` is set only after publication returns successfully; normal subsequent cycles skip committed events. `SKIP LOCKED` prevents two active publisher transactions from selecting the same locked row. Ordering is deterministic among currently eligible rows, but multiple workers do not provide strict global FIFO.
 
-## Tests
+Delivery is **at-least-once**, not exactly-once. If the logger performs its side effect and the database transaction subsequently fails before commit, the row remains pending and the same stable event ID/payload can be published again. `processed_at` records the publisher's committed state only; it cannot atomically commit an external consumer's business effect. The current application has no event consumer or deduplication mechanism. A real consumer should deduplicate by stable event ID, commonly by inserting the ID into an `inbox`/`processed_events` table in the same transaction as its business effect. Even then the publisher's log output itself can repeat. Restart safety follows from database-backed pending state, but an actual full process-restart scenario is not covered by an automated test.
+
+This small example has no request idempotency keys, consumer inbox, broker, DLQ, retry backoff, authentication, or production-grade observability. These are deliberate scope limits, not implemented guarantees.
+
+## Tests and CI
 
 ```bash
 ./gradlew clean test
 ./gradlew build
 ```
 
-Publisher unit tests run without Spring or Docker. Integration tests use PostgreSQL Testcontainers and require Docker.
+Unit tests do not require Spring or Docker. Integration tests use a shared-lifecycle PostgreSQL 17 Testcontainers instance and require Docker. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
 
-## Continuous Integration
+On environments requiring Docker API compatibility override:
 
-The GitHub Actions workflow in `.github/workflows/ci.yml` runs on pushes to `main` and `feat/**`, pull requests targeting `main`, and manual dispatch. It validates the Gradle Wrapper and runs `./gradlew clean build --no-daemon` on a GitHub-hosted Ubuntu runner with Eclipse Temurin Java 21. The build includes both unit and integration tests; Testcontainers starts its own PostgreSQL container, so CI does not need Docker Compose or a separately configured database.
+```bash
+OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew clean test
+```
 
-The workflow uploads Gradle's JUnit XML and HTML test reports as the `test-reports` artifact even when the build fails. Download the artifact from the workflow run's **Artifacts** section; failed test details are also available in the **Build and test** job logs. Locally, run the same build with `./gradlew clean build --no-daemon` (Docker must be available for integration tests). On Docker Engine 29 or newer, where the minimum API is 1.40, use `OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew clean build --no-daemon`; the workflow sets the same compatibility override.
+Stop local PostgreSQL with `docker compose down`; do not use `-v` unless intentionally deleting its persistent data.

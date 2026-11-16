@@ -25,10 +25,12 @@ management:
 logging:
   level:
     root: INFO
-    com.example.outbox: DEBUG
+    ing.recruitment: DEBUG
 
 outbox:
   publisher:
     enabled: true
     fixed-delay-ms: 5000
     batch-size: 10
+    logging:
+      payload-mode: METADATA_ONLY
