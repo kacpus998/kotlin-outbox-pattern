@@ -4,8 +4,10 @@ import ing.recruitment.orders.application.OrderService
 import ing.recruitment.testsupport.PostgresIntegrationTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -15,8 +17,10 @@ import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.context.annotation.AnnotationConfigApplicationContext
 import org.springframework.core.env.MapPropertySource
 import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.http.MediaType
 import org.springframework.r2dbc.core.DatabaseClient
 import org.springframework.scheduling.annotation.EnableScheduling
+import org.springframework.test.web.reactive.server.WebTestClient
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean
 import reactor.core.publisher.Flux
@@ -30,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 @SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = [
         "outbox.publisher.enabled=false",
         "outbox.publisher.fixed-delay-ms=100",
@@ -42,6 +47,9 @@ class ReactiveOutboxSchedulingIntegrationTest : PostgresIntegrationTest() {
 
     @Autowired
     private lateinit var jdbcTemplate: JdbcTemplate
+
+    @Autowired
+    private lateinit var webTestClient: WebTestClient
 
     @Autowired
     private lateinit var databaseClient: DatabaseClient
@@ -106,6 +114,84 @@ class ReactiveOutboxSchedulingIntegrationTest : PostgresIntegrationTest() {
 
             assertEquals(2, capturedTransactionIds(eventIds).size)
         } finally {
+            scheduler.close()
+        }
+    }
+
+    @Test
+    fun `HTTP order is pending before real scheduled publisher processes it`() {
+        val publishedIds = CopyOnWriteArrayList<UUID>()
+        doAnswer {
+            publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+
+        val response = webTestClient.post()
+            .uri("/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue("""{"customerId":"scheduled-http-e2e"}""")
+            .exchange()
+            .expectStatus()
+            .isCreated
+            .expectBody(ing.recruitment.orders.api.CreateOrderResponse::class.java)
+            .returnResult()
+            .responseBody!!
+        val orderId = response.orderId
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?",
+            UUID::class.java,
+            orderId,
+        )!!
+        assertNull(processedAt(eventId), "HTTP creation must not wait for publication")
+
+        val scheduler = startScheduler()
+        try {
+            awaitCondition { processedAt(eventId) != null }
+            assertEquals(listOf(eventId), publishedIds)
+        } finally {
+            scheduler.close()
+        }
+    }
+
+    @Test
+    fun `scheduled fixed delay does not start another cycle while current cycle is blocked`() {
+        val orderId = createOrder("single-flight")
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?",
+            UUID::class.java,
+            orderId,
+        )!!
+        val firstCycleEntered = CountDownLatch(1)
+        val secondCycleEntered = CountDownLatch(1)
+        val releaseFirstCycle = CountDownLatch(1)
+        val selectionCount = AtomicInteger()
+        doAnswer { invocation ->
+            if (selectionCount.incrementAndGet() == 2) secondCycleEntered.countDown()
+            @Suppress("UNCHECKED_CAST")
+            invocation.callRealMethod() as Flux<OutboxPendingEvent>
+        }.`when`(store).findAndLockUnprocessedReactive(1)
+        doAnswer {
+            firstCycleEntered.countDown()
+            check(releaseFirstCycle.await(10, TimeUnit.SECONDS))
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+
+        val scheduler = startScheduler()
+        try {
+            assertTrue(firstCycleEntered.await(10, TimeUnit.SECONDS), "scheduled cycle did not enter publication")
+            assertFalse(
+                secondCycleEntered.await(500, TimeUnit.MILLISECONDS),
+                "fixed-delay scheduler started a second selection before the first cycle completed",
+            )
+            assertEquals(1, selectionCount.get(), "only the first subscribed cycle may query while publication is blocked")
+            assertNull(processedAt(eventId), "first cycle must remain in flight while publication is blocked")
+
+            releaseFirstCycle.countDown()
+            assertTrue(secondCycleEntered.await(5, TimeUnit.SECONDS), "no later scheduled cycle started after completion")
+            assertEquals(2, selectionCount.get(), "each scheduled subscription must make one store selection")
+            awaitCondition { processedAt(eventId) != null }
+        } finally {
+            releaseFirstCycle.countDown()
             scheduler.close()
         }
     }

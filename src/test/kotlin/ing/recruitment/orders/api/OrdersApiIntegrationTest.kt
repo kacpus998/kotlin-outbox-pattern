@@ -24,8 +24,15 @@ import org.springframework.test.web.reactive.server.WebTestClient
 import reactor.core.publisher.Mono
 import reactor.test.StepVerifier
 import java.util.UUID
+import org.springframework.test.context.bean.override.mockito.MockitoBean
+import ing.recruitment.outbox.publisher.OutboxEventLogger
+import ing.recruitment.outbox.publisher.OutboxProcessingService
+import java.util.concurrent.CopyOnWriteArrayList
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = ["outbox.publisher.enabled=false"],
+)
 class OrdersApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired
     private lateinit var webTestClient: WebTestClient
@@ -41,6 +48,12 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
 
     @Autowired
     private lateinit var orderService: OrderService
+
+    @Autowired
+    private lateinit var processingService: OutboxProcessingService
+
+    @MockitoBean
+    private lateinit var eventLogger: OutboxEventLogger
 
     @BeforeEach
     fun cleanDatabase() {
@@ -96,6 +109,67 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun `resubscribing to the same order publisher creates independent orders and events`() {
+        val publisher = orderService.createOrder("resubscribed-customer")
+        val orderIds = mutableListOf<UUID>()
+
+        repeat(2) {
+            StepVerifier.create(publisher)
+                .assertNext(orderIds::add)
+                .verifyComplete()
+        }
+
+        assertEquals(2, orderIds.distinct().size)
+        assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM orders", Int::class.java))
+        assertEquals(2, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
+        assertEquals(
+            2,
+            jdbcTemplate.queryForObject("SELECT COUNT(DISTINCT id) FROM outbox_events", Int::class.java),
+        )
+        assertEquals(
+            orderIds.toSet(),
+            jdbcTemplate.query("SELECT id FROM orders") { rs, _ -> rs.getObject("id", UUID::class.java) }.toSet(),
+        )
+        assertEquals(
+            orderIds.toSet(),
+            jdbcTemplate.query("SELECT aggregate_id FROM outbox_events") { rs, _ ->
+                rs.getObject("aggregate_id", UUID::class.java)
+            }.toSet(),
+        )
+    }
+
+    @Test
+    fun `HTTP order creation returns with pending event and reactive publisher processes it later`() {
+        val publishedEventIds = CopyOnWriteArrayList<UUID>()
+        org.mockito.Mockito.doAnswer {
+            publishedEventIds.add(it.getArgument<ing.recruitment.outbox.publisher.OutboxPendingEvent>(0).id)
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+        val orderId = createOrder("""{"customerId":"http-outbox-publisher"}""")
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?",
+            UUID::class.java,
+            orderId,
+        )!!
+        assertNull(jdbcTemplate.queryForObject(
+            "SELECT processed_at FROM outbox_events WHERE id = ?",
+            { rs, _ -> rs.getTimestamp("processed_at") },
+            eventId,
+        ))
+
+        StepVerifier.create(processingService.processBatch())
+            .expectNext(1)
+            .verifyComplete()
+
+        assertNotNull(jdbcTemplate.queryForObject(
+            "SELECT processed_at FROM outbox_events WHERE id = ?",
+            { rs, _ -> rs.getTimestamp("processed_at") },
+            eventId,
+        ))
+        assertEquals(listOf(eventId), publishedEventIds)
+    }
+
+    @Test
     fun `repeated identical requests create distinct orders and events`() {
         val first = createOrder("""{"customerId":"123"}""")
         val second = createOrder("""{"customerId":"123"}""")
@@ -108,29 +182,93 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
 
     @Test
     fun `customerId longer than database column limit returns bad request`() {
-        exchange("""{"customerId":"${"x".repeat(256)}"}""")
+        val body = exchange("""{"customerId":"${"x".repeat(256)}"}""")
             .expectStatus()
             .isBadRequest
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
+        assertSafeErrorBody(body)
         assertNoOrderWrites()
+    }
+
+    @Test
+    fun `customerId at database column limit is accepted`() {
+        val customerId = "x".repeat(255)
+
+        val orderId = createOrder("""{"customerId":"$customerId"}""")
+
+        assertEquals(
+            customerId,
+            jdbcTemplate.queryForObject("SELECT customer_id FROM orders WHERE id = ?", String::class.java, orderId),
+        )
     }
 
     @ParameterizedTest
     @ValueSource(strings = ["{}", """{"customerId":null}""", """{"customerId":""}""", """{"customerId":"   "}"""])
     fun `invalid customerId returns bad request without writes`(request: String) {
-        exchange(request).expectStatus().isBadRequest
+        val body = exchange(request)
+            .expectStatus()
+            .isBadRequest
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
+        assertSafeErrorBody(body)
         assertNoOrderWrites()
     }
 
     @Test
     fun `malformed JSON returns bad request without writes`() {
-        webTestClient.post()
+        val body = webTestClient.post()
             .uri("/orders")
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue("""{"customerId":"""")
             .exchange()
             .expectStatus()
             .isBadRequest
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
 
+        assertSafeErrorBody(body)
+        assertNoOrderWrites()
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = [
+            """{"customerId":123}""",
+            """{"customerId":true}""",
+            """{"customerId":false}""",
+            """{"customerId":[]}""",
+            """{"customerId":{}}""",
+        ],
+    )
+    fun `customerId with invalid JSON type returns bad request without writes`(request: String) {
+        val body = exchange(request)
+            .expectStatus()
+            .isBadRequest
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
+        assertSafeErrorBody(body)
+        assertNoOrderWrites()
+    }
+
+    @Test
+    fun `unsupported content type returns error without writes`() {
+        val body = webTestClient.post()
+            .uri("/orders")
+            .contentType(MediaType.TEXT_PLAIN)
+            .bodyValue("customer-123")
+            .exchange()
+            .expectStatus()
+            .isEqualTo(415)
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
+
+        assertSafeErrorBody(body)
         assertNoOrderWrites()
     }
 
@@ -150,10 +288,58 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
                 "FOR EACH ROW EXECUTE FUNCTION fail_outbox_insert()",
         )
 
-        exchange("""{"customerId":"customer-rollback"}""")
+        StepVerifier.create(orderService.createOrder("customer-direct-error"))
+            .expectError()
+            .verify()
+        assertNoOrderWrites()
+
+        val responseBody = exchange("""{"customerId":"customer-rollback"}""")
             .expectStatus()
             .is5xxServerError
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
 
+        assertSafeErrorBody(responseBody)
+        assertNoOrderWrites()
+    }
+
+    @Test
+    fun `zero-row order insert returns an error without writes`() {
+        suppressInsert("orders", "suppress_order_insert")
+        try {
+            StepVerifier.create(orderService.createOrder("customer-zero-order"))
+                .expectErrorMatches {
+                    it.message == "Expected to insert one order, but inserted 0"
+                }
+                .verify()
+            assertNoOrderWrites()
+
+            val responseBody = exchange("""{"customerId":"customer-zero-order-http"}""")
+                .expectStatus()
+                .is5xxServerError
+                .expectBody(String::class.java)
+                .returnResult()
+                .responseBody
+            assertSafeErrorBody(responseBody)
+            assertNoOrderWrites()
+        } finally {
+            removeSuppressInsertTriggers()
+        }
+    }
+
+    @Test
+    fun `zero-row outbox insert returns an error and rolls back the order`() {
+        suppressInsert("outbox_events", "suppress_outbox_insert")
+
+        val responseBody = exchange("""{"customerId":"customer-zero-outbox"}""")
+            .expectStatus()
+            .is5xxServerError
+            .expectBody(String::class.java)
+            .returnResult()
+            .responseBody
+
+        assertSafeErrorBody(responseBody)
         assertNoOrderWrites()
     }
 
@@ -226,11 +412,65 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
         assertEquals(0, jdbcTemplate.queryForObject("SELECT COUNT(*) FROM outbox_events", Int::class.java))
     }
 
+    private fun assertSafeErrorBody(body: String?) {
+        val response = body.orEmpty()
+        listOf(
+            "stacktrace",
+            "exception",
+            "INSERT INTO",
+            "outbox_events",
+            "forced outbox insert failure",
+            "jdbc:",
+            "r2dbc:",
+            "postgresql://",
+            "spring.datasource",
+            "username",
+            "password",
+        ).forEach { sensitiveText ->
+            assertFalse(response.contains(sensitiveText, ignoreCase = true), "error response leaked '$sensitiveText'")
+        }
+    }
+
     private fun removeFailureTrigger() {
         try {
             jdbcTemplate.execute("DROP TRIGGER IF EXISTS fail_outbox_insert ON outbox_events")
+            removeSuppressInsertTriggers()
         } finally {
             jdbcTemplate.execute("DROP FUNCTION IF EXISTS fail_outbox_insert()")
         }
+    }
+
+    private fun removeSuppressInsertTriggers() {
+        jdbcTemplate.execute("DROP TRIGGER IF EXISTS suppress_order_insert ON orders")
+        jdbcTemplate.execute("DROP TRIGGER IF EXISTS suppress_outbox_insert ON outbox_events")
+        jdbcTemplate.execute("DROP FUNCTION IF EXISTS suppress_insert()")
+    }
+
+    private fun anyEvent(): ing.recruitment.outbox.publisher.OutboxPendingEvent =
+        org.mockito.ArgumentMatchers.any(ing.recruitment.outbox.publisher.OutboxPendingEvent::class.java)
+            ?: ing.recruitment.outbox.publisher.OutboxPendingEvent(
+                UUID.randomUUID(),
+                "matcher",
+                UUID.randomUUID(),
+                com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode(),
+                java.time.Instant.EPOCH,
+            )
+
+    private fun suppressInsert(table: String, trigger: String) {
+        require(table in setOf("orders", "outbox_events"))
+        require(trigger in setOf("suppress_order_insert", "suppress_outbox_insert"))
+        jdbcTemplate.execute(
+            """
+            CREATE OR REPLACE FUNCTION suppress_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RETURN NULL;
+            END;
+            $$
+            """.trimIndent(),
+        )
+        jdbcTemplate.execute(
+            "CREATE TRIGGER $trigger BEFORE INSERT ON $table " +
+                "FOR EACH ROW EXECUTE FUNCTION suppress_insert()",
+        )
     }
 }
