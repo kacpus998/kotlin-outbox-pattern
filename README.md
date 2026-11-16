@@ -4,7 +4,26 @@
 
 This project demonstrates the Transactional Outbox Pattern. Creating an order writes the order and its `OrderCreated` event to PostgreSQL in one transaction. A scheduled publisher reads pending events and simulates publication by writing them to the application log.
 
-## Technology stack
+## Implementation Versions
+
+| Version | Technology stack | Source code | Commit |
+| --- | --- | --- | --- |
+| Spring MVC (`spring-mvc-v1.0.0`) | Spring MVC, Spring Data JPA, JDBC | [Browse MVC implementation](https://github.com/kacpus998/kotlin-outbox-pattern/tree/spring-mvc-v1.0.0) | [`77afa59`](https://github.com/kacpus998/kotlin-outbox-pattern/commit/77afa592fc372e662236862617fd27aa4ec47616) |
+| Reactive (`reactive-v1.0.0`) | Spring WebFlux, Project Reactor, R2DBC | [Browse Reactive implementation](https://github.com/kacpus998/kotlin-outbox-pattern/tree/reactive-v1.0.0) | [`9924742`](https://github.com/kacpus998/kotlin-outbox-pattern/commit/99247425cba5ab849f3d4a205de0d5c8d4ceef26) |
+
+Both versions implement the Transactional Outbox Pattern, with different persistence and transaction models. The `main` branch currently contains the reactive implementation and may include commits after the `reactive-v1.0.0` tag.
+
+To check out a tagged version locally:
+
+```bash
+git switch --detach spring-mvc-v1.0.0
+git switch --detach reactive-v1.0.0
+git switch main
+```
+
+Checking out a tag puts Git in detached-HEAD mode; switch to `main` to return to the current development branch.
+
+## Technology stack (Reactive implementation)
 
 - Kotlin 2.2 and Java 21
 - Spring Boot 3.5, Spring WebFlux, and Project Reactor
@@ -104,22 +123,3 @@ For local PostgreSQL connectivity, start and stop Compose with `docker compose u
 ## Limitations
 
 Publication is simulated by logging; there is no message broker or event consumer. Log output can repeat after a failure or restart. The publisher has no dead-letter queue or retry backoff, so a repeatedly failing event can hold up later events in a batch. The project also omits request idempotency keys, authentication, and production-grade observability.
-
-## Implementation Versions
-
-| Version | Implementation |
-| --- | --- |
-| [`spring-mvc-v1.0.0`](https://github.com/kacpus998/kotlin-outbox-pattern/tree/spring-mvc-v1.0.0) | Spring MVC, Spring Data JPA, JDBC |
-| [`reactive-v1.0.0`](https://github.com/kacpus998/kotlin-outbox-pattern/tree/reactive-v1.0.0) | Spring WebFlux, Project Reactor, R2DBC |
-
-The `main` branch currently contains the reactive implementation. To check out either tagged version locally:
-
-```bash
-# Check out the MVC/JPA/JDBC version
-git switch --detach spring-mvc-v1.0.0
-
-# Or check out the reactive version
-git switch --detach reactive-v1.0.0
-```
-
-Each command checks out that version in detached-HEAD mode. Return to the current development branch with `git switch main`.
