@@ -4,14 +4,14 @@ Demonstration project for persisting an order and its `OrderCreated` event atomi
 
 ## Stack and layout
 
-Java 21, Kotlin 2.2, Spring Boot 3.5, Spring WebFlux, Project Reactor, Spring Data R2DBC, PostgreSQL 17, Flyway, JdbcTemplate, JUnit 5 and Testcontainers. The Orders API uses R2DBC; the scheduled outbox publisher remains JDBC-based.
+Java 21, Kotlin 2.2, Spring Boot 3.5, Spring WebFlux, Project Reactor, Spring Data R2DBC, PostgreSQL 17, Flyway, JUnit 5 and Testcontainers. Business reads and writes use R2DBC; JDBC is retained only for Flyway schema migrations and test assertions.
 
 ```text
 POST /orders → Mono<CreateOrderResponse> → R2DBC transaction → orders + outbox_events
-scheduled publisher → JDBC transaction → log → processed_at
+scheduled publisher → cold reactive transaction → SKIP LOCKED batch → log → processed_at
 ```
 
-The publisher selects `processed_at IS NULL` rows ordered by `(created_at, id)` using PostgreSQL `FOR UPDATE SKIP LOCKED`. The selected rows remain locked until the transaction commits or rolls back.
+The publisher selects `processed_at IS NULL` rows ordered by `(created_at, id)` using PostgreSQL `FOR UPDATE SKIP LOCKED`. It materializes the bounded batch before sequentially logging and updating events. The selected rows remain locked on the reactive transaction's connection until the transaction commits or rolls back.
 
 ## Run
 
@@ -22,7 +22,7 @@ docker compose up -d postgres
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-PostgreSQL configuration for local execution is in `application-local.yml`. `DB_HOST`, `DB_PORT`, and `DB_NAME` configure JDBC and R2DBC together; credentials use `DB_USERNAME` and `DB_PASSWORD`. If overriding connection URLs directly, set both `DB_URL` and `R2DBC_URL` to the same database and schema. Flyway applies the existing schema migration over JDBC before application requests are served. Orders persistence uses R2DBC, while the scheduled publisher uses a separate JDBC connection pool against that same schema. Timestamps use PostgreSQL `TIMESTAMPTZ`.
+PostgreSQL configuration for local execution is in `application-local.yml`. `DB_HOST`, `DB_PORT`, and `DB_NAME` configure Flyway's JDBC connection and R2DBC together; credentials use `DB_USERNAME` and `DB_PASSWORD`. If overriding connection URLs directly, set both `DB_URL` and `R2DBC_URL` to the same database and schema. Flyway applies the existing schema migration over JDBC before application requests are served. Orders persistence and the scheduled publisher use R2DBC. Timestamps use PostgreSQL `TIMESTAMPTZ`.
 
 ```bash
 curl -i -X POST http://localhost:8080/orders \
@@ -43,7 +43,7 @@ SELECT id, event_type, aggregate_id, payload, processed_at
 FROM outbox_events ORDER BY created_at, id;
 ```
 
-Defaults: scheduler enabled, fixed delay 5000 ms, batch size 10. Set `outbox.publisher.enabled=false` to disable it, or configure `outbox.publisher.fixed-delay-ms` and positive `outbox.publisher.batch-size`. The batch is processed in one transaction: any failure rolls back its database updates. A repeatedly failing (“poison”) event remains pending and may repeatedly fail the batch, delaying later events; no DLQ or backoff is implemented. A long-running publication holds row locks and its transaction open.
+Defaults: scheduler enabled, fixed delay 5000 ms, batch size 10. Set `outbox.publisher.enabled=false` to disable it, or configure `outbox.publisher.fixed-delay-ms` and positive `outbox.publisher.batch-size`. Spring's reactive fixed-delay scheduler waits for each Publisher to complete before starting the next cycle; each subscription begins a fresh reactive transaction and database query. The bounded batch is processed sequentially in one transaction: any publication or update failure rolls back its database updates. A repeatedly failing (“poison”) event remains pending and may repeatedly fail the batch, delaying later events; no DLQ or backoff is implemented. A long-running publication holds row locks and its transaction open.
 
 Logs default to `outbox.publisher.logging.payload-mode=METADATA_ONLY`, logging only event ID, event type and aggregate ID. `REDACTED` adds only allowlisted `orderId` and masked `customerId`; unknown payload fields are omitted. There is no RAW mode. This does not alter the stored JSONB payload.
 
@@ -62,7 +62,7 @@ This small example has no request idempotency keys, consumer inbox, broker, DLQ,
 ./gradlew build
 ```
 
-Unit tests do not require Spring or Docker. Integration tests use `WebTestClient`, `StepVerifier`, and a shared-lifecycle PostgreSQL 17 Testcontainers instance; Docker is required. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
+Unit tests do not require Spring or Docker. Integration tests use `WebTestClient`, `StepVerifier`, and a shared-lifecycle PostgreSQL 17 Testcontainers instance; Docker is required. Publisher tests exercise batch mappings and updates, rollback/at-least-once retry, concurrent `SKIP LOCKED` workers, cancellation/lock release, and scheduled transaction/error behavior against PostgreSQL. GitHub Actions runs the Gradle Wrapper on GitHub-hosted `ubuntu-latest` with Java 21, validates the wrapper, runs build and integration tests, and uploads JUnit reports. No deployment occurs. CI workflow actions are SHA-pinned and token permission is read-only.
 
 On environments requiring Docker API compatibility override:
 

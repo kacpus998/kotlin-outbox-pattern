@@ -18,11 +18,13 @@ import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import reactor.test.StepVerifier
+import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 @SpringBootTest(
@@ -61,7 +63,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
         )!!
         assertNull(processedAt(eventId))
 
-        assertEquals(1, processingService.processBatch())
+        assertEquals(1, processBatch())
 
         assertNotNull(processedAt(eventId))
         val event = OutboxPendingEvent(
@@ -86,8 +88,8 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
     fun `second cycle does not reprocess committed event`() {
         val orderId = createOrder("customer-123")
 
-        assertEquals(1, processingService.processBatch())
-        assertEquals(0, processingService.processBatch())
+        assertEquals(1, processBatch())
+        assertEquals(0, processBatch())
 
         verify(eventLogger, times(1)).publish(anyEvent())
         assertEquals(1, jdbcTemplate.queryForObject(
@@ -104,9 +106,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
             .doNothing()
             .`when`(eventLogger).publish(anyEvent())
 
-        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException::class.java) {
-            processingService.processBatch()
-        }
+        assertBatchFails()
         val eventId = jdbcTemplate.queryForObject(
             "SELECT id FROM outbox_events WHERE aggregate_id = ?",
             UUID::class.java,
@@ -114,7 +114,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
         )!!
         assertNull(processedAt(eventId))
 
-        assertEquals(1, processingService.processBatch())
+        assertEquals(1, processBatch())
         assertNotNull(processedAt(eventId))
     }
 
@@ -141,9 +141,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
                 "FOR EACH ROW EXECUTE FUNCTION fail_processed_update()",
         )
         try {
-            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException::class.java) {
-                processingService.processBatch()
-            }
+            assertBatchFails()
             assertNull(processedAt(eventId))
             assertEquals(listOf(eventId), publishedIds)
         } finally {
@@ -151,8 +149,86 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
             jdbcTemplate.execute("DROP FUNCTION IF EXISTS fail_processed_update()")
         }
 
-        assertEquals(1, processingService.processBatch())
+        assertEquals(1, processBatch())
         assertNotNull(processedAt(eventId))
+        assertEquals(listOf(eventId, eventId), publishedIds)
+    }
+
+    @Test
+    fun `failure on later update rolls back earlier updates in the same batch`() {
+        repeat(2) { createOrder("customer-batch-$it") }
+        val eventIds = jdbcTemplate.query(
+            "SELECT id FROM outbox_events ORDER BY created_at, id",
+        ) { rs, _ -> rs.getObject("id", UUID::class.java) }
+        val failingId = eventIds.last()
+        val publishedIds = CopyOnWriteArrayList<UUID>()
+        doAnswer {
+            publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+        jdbcTemplate.execute(
+            """
+            CREATE FUNCTION fail_selected_processed_update() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.id = '$failingId'::uuid THEN
+                    RAISE EXCEPTION 'forced batch update failure';
+                END IF;
+                RETURN NEW;
+            END;
+            $$
+            """.trimIndent(),
+        )
+        jdbcTemplate.execute(
+            "CREATE TRIGGER fail_selected_processed_update BEFORE UPDATE OF processed_at ON outbox_events " +
+                "FOR EACH ROW EXECUTE FUNCTION fail_selected_processed_update()",
+        )
+        try {
+            assertBatchFails()
+        } finally {
+            jdbcTemplate.execute("DROP TRIGGER IF EXISTS fail_selected_processed_update ON outbox_events")
+            jdbcTemplate.execute("DROP FUNCTION IF EXISTS fail_selected_processed_update()")
+        }
+
+        assertEquals(listOf(eventIds[0], eventIds[1]), publishedIds)
+        assertTrue(eventIds.all { processedAt(it) == null })
+    }
+
+    @Test
+    fun `cancellation rolls back and releases PostgreSQL row locks`() {
+        val orderId = createOrder("customer-cancel")
+        val eventId = jdbcTemplate.queryForObject(
+            "SELECT id FROM outbox_events WHERE aggregate_id = ?",
+            UUID::class.java,
+            orderId,
+        )!!
+        val loggerEntered = CountDownLatch(1)
+        val releaseLogger = CountDownLatch(1)
+        val publishedIds = CopyOnWriteArrayList<UUID>()
+        doAnswer {
+            publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
+            loggerEntered.countDown()
+            check(releaseLogger.await(10, TimeUnit.SECONDS))
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+
+        val subscription = processingService.processBatch().subscribe()
+        try {
+            assertTrue(loggerEntered.await(10, TimeUnit.SECONDS), "publisher did not reach event publication")
+            assertTrue(skipLockedPendingIds().isEmpty(), "event row should remain locked during the transaction")
+
+            subscription.dispose()
+        } finally {
+            releaseLogger.countDown()
+        }
+
+        awaitCondition(timeoutSeconds = 10) { eventId in skipLockedPendingIds() }
+        assertNull(processedAt(eventId), "cancellation must roll back the processed_at update")
+
+        doAnswer {
+            publishedIds.add(it.getArgument<OutboxPendingEvent>(0).id)
+            null
+        }.`when`(eventLogger).publish(anyEvent())
+        assertEquals(1, processBatch())
         assertEquals(listOf(eventId, eventId), publishedIds)
     }
 
@@ -175,9 +251,13 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
 
         val workers = Executors.newFixedThreadPool(2)
         try {
-            val first = workers.submit<Int> { processingService.processBatch() }
+            val first = workers.submit<Int> {
+                requireNotNull(processingService.processBatch().block(Duration.ofSeconds(10)))
+            }
             assertTrue(firstLoggerEntered.await(10, TimeUnit.SECONDS), "first worker did not acquire a row lock")
-            val second = workers.submit<Int> { processingService.processBatch() }
+            val second = workers.submit<Int> {
+                requireNotNull(processingService.processBatch().block(Duration.ofSeconds(10)))
+            }
 
             assertEquals(2, second.get(10, TimeUnit.SECONDS))
             releaseFirstWorker.countDown()
@@ -199,7 +279,7 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
     fun `one cycle processes no more than configured batch size`() {
         repeat(3) { createOrder("customer-$it") }
 
-        assertEquals(2, processingService.processBatch())
+        assertEquals(2, processBatch())
         assertEquals(2, jdbcTemplate.queryForObject(
             "SELECT COUNT(*) FROM outbox_events WHERE processed_at IS NOT NULL",
             Int::class.java,
@@ -216,12 +296,39 @@ class OutboxPublisherIntegrationTest : PostgresIntegrationTest() {
         id,
     )
 
+    private fun skipLockedPendingIds(): List<UUID> = jdbcTemplate.query(
+        "SELECT id FROM outbox_events WHERE processed_at IS NULL ORDER BY created_at, id FOR UPDATE SKIP LOCKED",
+    ) { rs, _ -> rs.getObject("id", UUID::class.java) }
+
+    private fun awaitCondition(timeoutSeconds: Long, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds)
+        while (System.nanoTime() < deadline) {
+            if (condition()) return
+            Thread.sleep(10)
+        }
+        assertTrue(condition(), "condition was not met within $timeoutSeconds seconds")
+    }
+
     private fun createOrder(customerId: String): UUID {
         var orderId: UUID? = null
         StepVerifier.create(orderService.createOrder(customerId))
             .assertNext { orderId = it }
             .verifyComplete()
         return requireNotNull(orderId)
+    }
+
+    private fun processBatch(): Int {
+        var processed: Int? = null
+        StepVerifier.create(processingService.processBatch())
+            .assertNext { processed = it }
+            .verifyComplete()
+        return requireNotNull(processed)
+    }
+
+    private fun assertBatchFails() {
+        StepVerifier.create(processingService.processBatch())
+            .expectError(IllegalStateException::class.java)
+            .verify()
     }
 
     private fun anyEvent(): OutboxPendingEvent =

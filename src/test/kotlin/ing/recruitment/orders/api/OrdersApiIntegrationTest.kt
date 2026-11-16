@@ -187,6 +187,18 @@ class OrdersApiIntegrationTest : PostgresIntegrationTest() {
             .value { assertTrue(it in 200..399) }
     }
 
+    @Test
+    fun `actuator health endpoint remains available`() {
+        webTestClient.get()
+            .uri("/actuator/health")
+            .exchange()
+            .expectStatus()
+            .isOk
+            .expectBody()
+            .jsonPath("$.status")
+            .isEqualTo("UP")
+    }
+
     private fun exchange(request: String) =
         webTestClient.post()
             .uri("/orders")
