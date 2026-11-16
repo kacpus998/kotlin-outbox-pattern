@@ -45,6 +45,8 @@ tasks.withType<KotlinCompile>().configureEach {
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
-    // Docker Engine 29 no longer accepts the API version used by older docker-java defaults.
-    systemProperty("api.version", "1.40")
+    // Pin only when requested; CI and Docker Engines requiring API 1.40 set this explicitly.
+    providers.environmentVariable("OUTBOX_DOCKER_API_VERSION").orNull?.let {
+        systemProperty("api.version", it)
+    }
 }

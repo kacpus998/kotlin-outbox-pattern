@@ -63,3 +63,9 @@ Stop PostgreSQL with `docker compose down`. Add `-v` only to delete its persiste
 ```
 
 Publisher unit tests run without Spring or Docker. Integration tests use PostgreSQL Testcontainers and require Docker.
+
+## Continuous Integration
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs on pushes to `main` and `feat/**`, pull requests targeting `main`, and manual dispatch. It validates the Gradle Wrapper and runs `./gradlew clean build --no-daemon` on a GitHub-hosted Ubuntu runner with Eclipse Temurin Java 21. The build includes both unit and integration tests; Testcontainers starts its own PostgreSQL container, so CI does not need Docker Compose or a separately configured database.
+
+The workflow uploads Gradle's JUnit XML and HTML test reports as the `test-reports` artifact even when the build fails. Download the artifact from the workflow run's **Artifacts** section; failed test details are also available in the **Build and test** job logs. Locally, run the same build with `./gradlew clean build --no-daemon` (Docker must be available for integration tests). On Docker Engine 29 or newer, where the minimum API is 1.40, use `OUTBOX_DOCKER_API_VERSION=1.40 ./gradlew clean build --no-daemon`; the workflow sets the same compatibility override.
